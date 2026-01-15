@@ -1,30 +1,90 @@
-#!/bin/bash
-# Generate client certificates for a docker host.
-# Command line params:
-# - $1 - Path to ca.pem
-# - $2 - Path to ca-key.pem
+#!/usr/bin/env bash
+set -euo pipefail
 
-if [ "$1" = "" ] || [ "$2" = "" ]; then
-    echo "Please provide paths to the ca.pem and ca-key.pem files."
+usage() {
+    cat <<'EOF'
+Usage:
+  ./generate-client-certs.sh <ca.pem> <ca-key.pem>
+  ./generate-client-certs.sh -c <ca.pem> -k <ca-key.pem> [-o <outdir>] [-d <days>] [-s <subject>]
+
+Options:
+  -c  Path to CA certificate (ca.pem)
+  -k  Path to CA private key (ca-key.pem)
+  -o  Output directory (default: current directory)
+  -d  Certificate validity in days (default: 365)
+  -s  Subject for the client certificate (default: /CN=docker-client)
+  -h  Show this help
+EOF
+}
+
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "openssl not found on PATH."
+    exit 127
+fi
+
+ca_cert=""
+ca_key=""
+out_dir="."
+days="365"
+subject="/CN=docker-client"
+
+if [ "$#" -ge 1 ] && [[ "$1" == -* ]]; then
+    while getopts ":c:k:o:d:s:h" opt; do
+        case "$opt" in
+            c) ca_cert="$OPTARG" ;;
+            k) ca_key="$OPTARG" ;;
+            o) out_dir="$OPTARG" ;;
+            d) days="$OPTARG" ;;
+            s) subject="$OPTARG" ;;
+            h) usage; exit 0 ;;
+            *) usage; exit 2 ;;
+        esac
+    done
+else
+    if [ "$#" -lt 2 ]; then
+        usage
+        exit 2
+    fi
+    ca_cert="$1"
+    ca_key="$2"
+fi
+
+if [ -z "$ca_cert" ] || [ -z "$ca_key" ]; then
+    usage
     exit 2
 fi
 
-echo 01 > ca.srl
-cp "$1" ca.pem
-cp "$2" ca-key.pem
+if [ ! -r "$ca_cert" ] || [ ! -r "$ca_key" ]; then
+    echo "CA certificate or key not readable."
+    exit 2
+fi
 
-openssl genrsa -out client-key.pem
-openssl req -new -key client-key.pem -out client.csr
+mkdir -p "$out_dir"
 
-echo 'extendedKeyUsage = clientAuth' > extfile.cnf
+tmp_dir="$(mktemp -d)"
+cleanup() {
+    rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
 
-openssl x509 -req -days 365 \
-    -in client.csr \
-    -out client-cert.pem \
-    -CA ca.pem \
-    -CAkey ca-key.pem \
-    -extfile extfile.cnf
+umask 077
 
-# Cleanup
-rm ca.srl ca.pem ca-key.pem client.csr extfile.cnf
+key_path="$out_dir/client-key.pem"
+cert_path="$out_dir/client-cert.pem"
+csr_path="$tmp_dir/client.csr"
+extfile_path="$tmp_dir/extfile.cnf"
+serial_path="$tmp_dir/ca.srl"
 
+openssl genrsa -out "$key_path" 4096
+openssl req -new -key "$key_path" -out "$csr_path" -subj "$subject"
+
+printf '%s\n' 'extendedKeyUsage = clientAuth' > "$extfile_path"
+
+openssl x509 -req -days "$days" \
+    -in "$csr_path" \
+    -out "$cert_path" \
+    -CA "$ca_cert" \
+    -CAkey "$ca_key" \
+    -extfile "$extfile_path" \
+    -CAcreateserial \
+    -CAserial "$serial_path"
